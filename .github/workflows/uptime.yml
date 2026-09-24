@@ -1,7 +1,7 @@
 name: uptime abrisart.com
-# Зовнішній монітор abrisart.com: спрацьовує, коли сервер мертвий і сам нічого не надішле
-# (серверні алерти живуть у /usr/local/sbin/ab_alerts.sh). Публічний репозиторій: хвилини Actions безкоштовні.
-# Секрети: TG_TOKEN (бот @abrisart_bot), TG_CHAT (приватний чат власника). У лог нічого секретного не друкується.
+# Зовнішній монітор abrisart.com: спрацьовує, коли сервер мертвий і сам нічого не надішле, і ловить те,
+# чого з сервера не видно (Cloudflare, індексація, шлях покупця). Серверні алерти: /usr/local/sbin/ab_alerts.sh.
+# Публічний репозиторій: хвилини Actions безкоштовні. Секрети: TG_TOKEN, TG_CHAT. У лог нічого секретного не друкується.
 on:
   schedule: [{ cron: '*/15 * * * *' }]
   workflow_dispatch:
@@ -11,7 +11,7 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 8
     steps:
       - uses: actions/checkout@v4
       - name: probe
@@ -20,39 +20,88 @@ jobs:
           TG_CHAT: ${{ secrets.TG_CHAT }}
         run: |
           set -u
-          UA='Mozilla/5.0 (X11; Linux x86_64) abrisart-uptime/1.0'
+          UA='Mozilla/5.0 (X11; Linux x86_64) Chrome/128 abrisart-uptime/1.1'
+          GB='Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)'
           fail=''
-          chk() {   # $1 url, $2 обов'язковий текст
+          add(){ fail="$fail
+          ❌ $*"; }
+          chk(){  # url, текст, [UA]
             code=000
             for t in 1 2; do
-              out=$(curl -sS -L --max-redirs 3 -A "$UA" --compressed --max-time 30 -w '\n__%{http_code}' "$1" 2>&1) || true
+              out=$(curl -sS -L --max-redirs 3 -A "${3:-$UA}" --compressed --max-time 30 -w '\n__%{http_code}' "$1" 2>&1 || true)
               code=${out##*__}
               if [ "$code" = 200 ] && grep -qF "$2" <<<"$out"; then return 0; fi
               sleep 20
             done
-            fail="$fail
-          ❌ $1 → $code"
+            add "$1 → HTTP $code або немає «$2»"
           }
+          # 1) ключові сторінки
           chk https://abrisart.com/en/ 'Abris Art'
           chk https://abrisart.com/en/category/bead-embroidery-kits 'Bead'
           chk https://abrisart.com/en/product/bead-embroidery-kit-on-art-canvas-bast-in-the-night-ab695 'Add to Cart'
-          chk https://abrisart.com/en/cart '</html>'
-          chk https://abrisart.com/sitemap.xml '<'
-          # CSS: найбільший бандл теми на головній має бути > 400 КБ (main.min.css на місці)
-          home=$(curl -sS -A "$UA" --compressed --max-time 30 https://abrisart.com/en/ || true)
+          chk https://abrisart.com/sitemap.xml 'sitemap-en.xml'
+          chk https://abrisart.com/ 'вишив' "$GB"                 # українська головна для Google
+          # 2) швидкість (TTFB головної, дві спроби)
+          slow=1; s=99
+          for t in 1 2; do
+            s=$(curl -sS -o /dev/null -A "$UA" --max-time 30 -w '%{time_starttransfer}' https://abrisart.com/en/ || echo 99)
+            if awk -v s="$s" 'BEGIN{exit !(s<4)}'; then slow=0; break; fi
+            sleep 10
+          done
+          [ $slow = 1 ] && add "Головна відповідає повільно: TTFB ${s} с (> 4 с)"
+          # 3) індексація: robots, noindex, canonical, аналітика
+          rb=$(curl -sS --max-time 20 https://abrisart.com/robots.txt || true)
+          if awk 'BEGIN{ua=0;f=0} /^User-agent:[ \t]*\*/{ua=1;next} /^User-agent:/{ua=0} ua && /^Disallow:[ \t]*\/[ \t]*$/{f=1} END{exit !f}' <<<"$rb"; then add "robots.txt закриває весь сайт (Disallow: /)"; fi
+          home=$(curl -sS -L -A "$UA" --compressed --max-time 30 https://abrisart.com/en/ || true)
+          grep -qiE '<meta[^>]+name="robots"[^>]+noindex' <<<"$home" && add "На /en/ стоїть noindex"
+          grep -qi 'rel="canonical"' <<<"$home" || add "На /en/ зник canonical"
+          grep -q 'GTM-5C93PMQ' <<<"$home" || add "На /en/ немає GTM-5C93PMQ (аналітика і реклама не рахують)"
+          # 4) CSS-бандл теми > 400 КБ (main.min.css на місці)
           max=0
           for c in $(grep -oE 'catalog/view/theme/oct_deals/stylesheet/css/[0-9a-f]{32}\.css' <<<"$home" | sort -u); do
-            s=$(curl -sS -A "$UA" -H 'Accept-Encoding: identity' --max-time 30 -o /dev/null -w '%{size_download}' "https://abrisart.com/$c" || echo 0)
-            [ "${s:-0}" -gt "$max" ] && max=$s
+            sz=$(curl -sS -A "$UA" -H 'Accept-Encoding: identity' --max-time 30 -o /dev/null -w '%{size_download}' "https://abrisart.com/$c" || echo 0)
+            [ "${sz:-0}" -gt "$max" ] && max=$sz
           done
-          [ "$max" -gt 409600 ] || fail="$fail
-          ❌ CSS-бандл теми лише ${max} Б (<400 КБ): ймовірно, зник main.min.css"
+          [ "$max" -gt 409600 ] || add "CSS-бандл теми лише ${max} Б (<400 КБ): сайт без стилів?"
+          # 5) шлях покупця: у кошик → кошик → оформлення
+          J=$(mktemp)
+          curl -sS -A "$UA" -c $J -b $J -o /dev/null --max-time 30 https://abrisart.com/en/ || true
+          ra=$(curl -sS -A "$UA" -c $J -b $J --max-time 30 -X POST -H 'X-Requested-With: XMLHttpRequest' -d 'product_id=944&quantity=1' 'https://abrisart.com/index.php?route=checkout/cart/add' || true)
+          grep -q 'success\|add_to_cart' <<<"$ra" || add "Додавання в кошик не працює (відповідь: $(head -c 120 <<<"$ra"))"
+          cart=$(curl -sS -L -A "$UA" -c $J -b $J --compressed --max-time 30 https://abrisart.com/en/cart || true)
+          if ! grep -q 'Bast in the night' <<<"$cart" || ! grep -q 'Total' <<<"$cart"; then add "Кошик не показує доданий товар або підсумок"; fi
+          co=$(curl -sS -L -A "$UA" -c $J -b $J --compressed --max-time 40 -w '\n__%{http_code}' 'https://abrisart.com/index.php?route=checkout/checkout' || true)
+          if [ "${co##*__}" != 200 ] || ! grep -qi 'checkout' <<<"$co"; then add "Сторінка оформлення замовлення: HTTP ${co##*__}"; fi
+          rm -f $J
+          # 6) фід Merchant/Meta: доступний, великий, свіжий
+          hdr=$(curl -sSI --max-time 30 https://abrisart.com/feeds/abrisart-en-EUR.xml || true)
+          fcode=$(awk 'NR==1{print $2}' <<<"$hdr")
+          flen=$(grep -i '^content-length' <<<"$hdr" | tail -1 | tr -dc 0-9)
+          flm=$(grep -i '^last-modified' <<<"$hdr" | tail -1 | cut -d' ' -f2- | tr -d '\r')
+          [ "$fcode" = 200 ] || add "Фід abrisart-en-EUR.xml: HTTP $fcode"
+          if [ -n "$flen" ] && [ "$flen" -lt 3000000 ]; then add "Фід abrisart-en-EUR.xml замалий: ${flen} Б"; fi
+          if [ -n "$flm" ]; then
+            fage=$(( ( $(date +%s) - $(date -d "$flm" +%s 2>/dev/null || date +%s) ) / 3600 ))
+            [ "$fage" -gt 6 ] && add "Фід abrisart-en-EUR.xml не оновлювався ${fage} год"
+          fi
+          # 7) сертифікат Cloudflare і старий домен
+          exp=$(echo | openssl s_client -servername abrisart.com -connect abrisart.com:443 2>/dev/null | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2)
+          if [ -n "$exp" ]; then
+            days=$(( ( $(date -d "$exp" +%s) - $(date +%s) ) / 86400 ))
+            [ "$days" -lt 14 ] && add "Сертифікат abrisart.com (Cloudflare) спливає через ${days} дн."
+          else add "Не вдалось прочитати сертифікат abrisart.com"; fi
+          loc=$(curl -sSI --max-time 20 https://abrisart.ua/ | grep -i '^location' | tr -d '\r' || true)
+          grep -qi 'abrisart.com' <<<"$loc" || add "abrisart.ua більше не веде на abrisart.com ($loc)"
+          # 8) адмінка відповідає (без входу)
+          ad=$(curl -sS -o /dev/null -A "$UA" --max-time 30 -w '%{http_code}' https://abrisart.com/admin/ || echo 000)
+          case "$ad" in 5*|000) add "Адмінка /admin/ → HTTP $ad";; esac
           if [ -n "$fail" ]; then
             curl -sS -o /dev/null --data-urlencode "chat_id=$TG_CHAT" --data-urlencode "text=🔴 [abrisart uptime]$fail" \
               "https://api.telegram.org/bot${TG_TOKEN}/sendMessage"
+            printf 'FAILED:%s\n' "$fail"
             exit 1
           fi
-          echo "all green"
+          echo "all green (TTFB ${s}s, CSS ${max} B, feed ${flen:-?} B, cert ${days:-?} d)"
       - name: keepalive (GitHub вимикає розклад після 60 днів без комітів)
         if: github.event_name == 'schedule'
         run: |
