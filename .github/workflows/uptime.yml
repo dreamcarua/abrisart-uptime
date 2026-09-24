@@ -1,0 +1,62 @@
+name: uptime abrisart.com
+# Зовнішній монітор abrisart.com: спрацьовує, коли сервер мертвий і сам нічого не надішле
+# (серверні алерти живуть у /usr/local/sbin/ab_alerts.sh). Публічний репозиторій: хвилини Actions безкоштовні.
+# Секрети: TG_TOKEN (бот @abrisart_bot), TG_CHAT (приватний чат власника). У лог нічого секретного не друкується.
+on:
+  schedule: [{ cron: '*/15 * * * *' }]
+  workflow_dispatch:
+concurrency: { group: uptime, cancel-in-progress: true }
+permissions:
+  contents: write
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: probe
+        env:
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT: ${{ secrets.TG_CHAT }}
+        run: |
+          set -u
+          UA='Mozilla/5.0 (X11; Linux x86_64) abrisart-uptime/1.0'
+          fail=''
+          chk() {   # $1 url, $2 обов'язковий текст
+            code=000
+            for t in 1 2; do
+              out=$(curl -sS -L --max-redirs 3 -A "$UA" --compressed --max-time 30 -w '\n__%{http_code}' "$1" 2>&1) || true
+              code=${out##*__}
+              if [ "$code" = 200 ] && grep -qF "$2" <<<"$out"; then return 0; fi
+              sleep 20
+            done
+            fail="$fail
+          ❌ $1 → $code"
+          }
+          chk https://abrisart.com/en/ 'Abris Art'
+          chk https://abrisart.com/en/category/bead-embroidery-kits 'Bead'
+          chk https://abrisart.com/en/product/bead-embroidery-kit-on-art-canvas-bast-in-the-night-ab695 'Add to Cart'
+          chk https://abrisart.com/en/cart '</html>'
+          chk https://abrisart.com/sitemap.xml '<'
+          # CSS: найбільший бандл теми на головній має бути > 400 КБ (main.min.css на місці)
+          home=$(curl -sS -A "$UA" --compressed --max-time 30 https://abrisart.com/en/ || true)
+          max=0
+          for c in $(grep -oE 'catalog/view/theme/oct_deals/stylesheet/css/[0-9a-f]{32}\.css' <<<"$home" | sort -u); do
+            s=$(curl -sS -A "$UA" -H 'Accept-Encoding: identity' --max-time 30 -o /dev/null -w '%{size_download}' "https://abrisart.com/$c" || echo 0)
+            [ "${s:-0}" -gt "$max" ] && max=$s
+          done
+          [ "$max" -gt 409600 ] || fail="$fail
+          ❌ CSS-бандл теми лише ${max} Б (<400 КБ): ймовірно, зник main.min.css"
+          if [ -n "$fail" ]; then
+            curl -sS -o /dev/null --data-urlencode "chat_id=$TG_CHAT" --data-urlencode "text=🔴 [abrisart uptime]$fail" \
+              "https://api.telegram.org/bot${TG_TOKEN}/sendMessage"
+            exit 1
+          fi
+          echo "all green"
+      - name: keepalive (GitHub вимикає розклад після 60 днів без комітів)
+        if: github.event_name == 'schedule'
+        run: |
+          if [ "$(date -u +%d%H)" = "0103" ] && [ "$(date -u +%M)" -lt 15 ]; then
+            git config user.name uptime-bot; git config user.email uptime-bot@users.noreply.github.com
+            date -u +%F > last-run.txt; git add last-run.txt; git commit -m "keepalive $(date -u +%F)" && git push
+          fi
