@@ -76,7 +76,10 @@ jobs:
           # 6) фід Merchant/Meta: доступний, великий, свіжий
           hdr=$(curl -sSI --max-time 30 https://abrisart.com/feeds/abrisart-en-EUR.xml || true)
           fcode=$(awk 'NR==1{print $2}' <<<"$hdr")
-          flen=$(grep -i '^content-length' <<<"$hdr" | tail -1 | tr -dc 0-9)
+          flen=''   # розмір лише раз на годину: Cloudflare не віддає Content-Length, а фід ~10 МБ
+          if [ "$(date -u +%M)" -lt 15 ] || [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            flen=$(curl -sS -o /dev/null -H 'Accept-Encoding: identity' --max-time 90 -w '%{size_download}' https://abrisart.com/feeds/abrisart-en-EUR.xml || echo 0)
+          fi
           flm=$(grep -i '^last-modified' <<<"$hdr" | tail -1 | cut -d' ' -f2- | tr -d '\r')
           [ "$fcode" = 200 ] || add "Фід abrisart-en-EUR.xml: HTTP $fcode"
           if [ -n "$flen" ] && [ "$flen" -lt 3000000 ]; then add "Фід abrisart-en-EUR.xml замалий: ${flen} Б"; fi
