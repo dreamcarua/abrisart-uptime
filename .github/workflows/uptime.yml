@@ -70,8 +70,10 @@ jobs:
           grep -q 'success\|add_to_cart' <<<"$ra" || add "Додавання в кошик не працює (відповідь: $(head -c 120 <<<"$ra"))"
           cart=$(curl -sS -L -A "$UA" -c $J -b $J --compressed --max-time 30 https://abrisart.com/en/cart || true)
           if ! grep -q 'Bast in the night' <<<"$cart" || ! grep -q 'Total' <<<"$cart"; then add "Кошик не показує доданий товар або підсумок"; fi
-          co=$(curl -sS -L -A "$UA" -c $J -b $J --compressed --max-time 40 -w '\n__%{http_code}' 'https://abrisart.com/index.php?route=checkout/checkout' || true)
-          if [ "${co##*__}" != 200 ] || ! grep -qi 'checkout' <<<"$co"; then add "Сторінка оформлення замовлення: HTTP ${co##*__}"; fi
+          co=$(curl -sS -L -A "$UA" -c $J -b $J --compressed --max-time 40 -w '\n__%{http_code}' 'https://abrisart.com/en/checkout' || true)
+          if [ "${co##*__}" != 200 ] || ! grep -qi 'checkout' <<<"$co"; then add "Сторінка оформлення замовлення /en/checkout: HTTP ${co##*__}"; fi
+          # ab 25.09.2026: EN-оформлення має лишатись англійським і в євро (24.09 перемикало на UA/UAH)
+          if [ "${co##*__}" = 200 ] && { ! grep -q 'lang="en"' <<<"$co" || ! grep -q '€' <<<"$co" || grep -q '₴\|грн' <<<"$co"; }; then add "EN-оформлення не англійське або не в EUR"; fi
           rm -f $J
           # 6) фід Merchant/Meta: доступний, великий, свіжий
           hdr=$(curl -sSI --max-time 30 https://abrisart.com/feeds/abrisart-en-EUR.xml || true)
