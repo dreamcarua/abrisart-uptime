@@ -1,0 +1,71 @@
+name: uptime barpi.com.ua
+# Зовнішній монітор barpi.com.ua (Horoshop SaaS за Cloudflare) у цьому публічному репо, бо тут уже є
+# Telegram-секрети TG_TOKEN/TG_CHAT, а хвилини Actions для публічних репо безкоштовні (site-director, 10.11.2026).
+# Horoshop віддає людям JS-челендж (~320 Б), тому сторінки перевіряються з UA Googlebot, як їх бачить пошук.
+on:
+  schedule: [{ cron: '7,22,37,52 * * * *' }]
+  workflow_dispatch:
+concurrency: { group: uptime-barpi, cancel-in-progress: true }
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - name: probe
+        env:
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT: ${{ secrets.TG_CHAT }}
+        run: |
+          set -u
+          GB='Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)'
+          fail=''
+          add(){ fail="$fail
+          ❌ $*"; }
+          chk(){  # url, текст
+            code=000
+            for t in 1 2; do
+              out=$(curl -sS -L --max-redirs 3 -A "$GB" --compressed --max-time 30 -w '\n__%{http_code}' "$1" 2>&1 || true)
+              code=${out##*__}
+              if [ "$code" = 200 ] && grep -qF "$2" <<<"$out"; then return 0; fi
+              sleep 20
+            done
+            add "$1 → HTTP $code або немає «$2»"
+          }
+          # 1) ключові сторінки (головна, каталог, товар, блог, карта сайту)
+          chk https://barpi.com.ua/ 'Barpi'
+          chk https://barpi.com.ua/kataloh/ 'Barpi'
+          chk https://barpi.com.ua/kuriachi-shlunky-barpi-20g/ 'Barpi'
+          chk https://barpi.com.ua/blog/ 'Barpi'
+          chk https://barpi.com.ua/sitemap.xml 'news-sitemap.xml'
+          # 2) швидкість (TTFB головної, дві спроби)
+          slow=1; s=99
+          for t in 1 2; do
+            s=$(curl -sS -o /dev/null -A "$GB" --max-time 30 -w '%{time_starttransfer}' https://barpi.com.ua/ || echo 99)
+            if awk -v s="$s" 'BEGIN{exit !(s<4)}'; then slow=0; break; fi
+            sleep 10
+          done
+          [ $slow = 1 ] && add "Головна barpi.com.ua відповідає повільно: TTFB ${s} с (> 4 с)"
+          # 3) індексація: robots, noindex, canonical
+          rb=$(curl -sS --max-time 20 https://barpi.com.ua/robots.txt || true)
+          if awk 'BEGIN{ua=0;f=0} /^User-agent:[ \t]*\*/{ua=1;next} /^User-agent:/{ua=0} ua && /^Disallow:[ \t]*\/[ \t]*$/{f=1} END{exit !f}' <<<"$rb"; then add "robots.txt barpi закриває весь сайт (Disallow: /)"; fi
+          home=$(curl -sS -L -A "$GB" --compressed --max-time 30 https://barpi.com.ua/ || true)
+          grep -qiE '<meta[^>]+name="robots"[^>]+noindex' <<<"$home" && add "На головній barpi стоїть noindex"
+          grep -qi 'rel="canonical"' <<<"$home" || add "На головній barpi зник canonical"
+          # 4) медіа статей (Worker barpi-media): невідомий файл має давати рівно 404, а не 5xx
+          mc=$(curl -sS -o /dev/null --max-time 20 -w '%{http_code}' https://barpi.com.ua/media/sd/uptime-probe-missing.webp || echo 000)
+          [ "$mc" = 404 ] || add "Worker медіа статей /media/sd/ → HTTP $mc (очікувано 404 для неіснуючого файлу)"
+          # 5) сертифікат
+          exp=$(echo | openssl s_client -servername barpi.com.ua -connect barpi.com.ua:443 2>/dev/null | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2)
+          if [ -n "$exp" ]; then
+            days=$(( ( $(date -d "$exp" +%s) - $(date +%s) ) / 86400 ))
+            [ "$days" -lt 14 ] && add "Сертифікат barpi.com.ua спливає через ${days} дн."
+          else add "Не вдалось прочитати сертифікат barpi.com.ua"; fi
+          if [ -n "$fail" ]; then
+            curl -sS -o /dev/null --data-urlencode "chat_id=$TG_CHAT" --data-urlencode "text=🔴 [barpi uptime]$fail" \
+              "https://api.telegram.org/bot${TG_TOKEN}/sendMessage"
+            printf 'FAILED:%s\n' "$fail"
+            exit 1
+          fi
+          echo "all green (TTFB ${s}s, cert ${days:-?} d)"
