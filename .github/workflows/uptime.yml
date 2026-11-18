@@ -18,7 +18,16 @@ jobs:
         env:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT: ${{ secrets.TG_CHAT }}
+          AUTOFIX_TOKEN: ${{ secrets.AUTOFIX_TOKEN }}
         run: |
+          # failure -> auto-repair pipeline (owner-dm edge, 24h dedup there); never fails the job
+          autofix_report() {
+            [ -n "${AUTOFIX_TOKEN:-}" ] || return 0
+            _P=$(jq -cn --arg a "$1" --arg p "$2" '{alert:$a,project:$p}' 2>/dev/null) || return 0
+            curl -s -m 20 -o /dev/null -X POST "https://wotghlaehnvxyeacznvv.supabase.co/functions/v1/owner-dm" \
+              -H "x-autofix-token: $AUTOFIX_TOKEN" -H "content-type: application/json" --data "$_P" || true
+            return 0
+          }
           set -u
           UA='Mozilla/5.0 (X11; Linux x86_64) Chrome/128 abrisart-uptime/1.1'
           GB='Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)'
@@ -101,6 +110,7 @@ jobs:
           ad=$(curl -sS -o /dev/null -A "$UA" --max-time 30 -w '%{http_code}' https://abrisart.com/admin/ || echo 000)
           case "$ad" in 5*|000) add "Адмінка /admin/ → HTTP $ad";; esac
           if [ -n "$fail" ]; then
+            autofix_report "[abrisart uptime]$fail" abrisart
             curl -sS -o /dev/null --data-urlencode "chat_id=$TG_CHAT" --data-urlencode "text=🔴 [abrisart uptime]$fail" \
               "https://api.telegram.org/bot${TG_TOKEN}/sendMessage"
             printf 'FAILED:%s\n' "$fail"
