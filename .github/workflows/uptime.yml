@@ -99,7 +99,11 @@ jobs:
             [ "$fage" -gt 6 ] && add "Фід abrisart-en-EUR.xml не оновлювався ${fage} год"
           fi
           # 7) сертифікат Cloudflare і старий домен
-          exp=$(echo | openssl s_client -servername abrisart.com -connect abrisart.com:443 2>/dev/null | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2)
+          exp=''
+          for t in 1 2 3; do  # разовий збій handshake не алерт: 3 спроби, timeout 15 с
+            exp=$(echo | timeout 15 openssl s_client -servername abrisart.com -connect abrisart.com:443 2>/dev/null | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2)
+            [ -n "$exp" ] && break; sleep 10
+          done
           if [ -n "$exp" ]; then
             days=$(( ( $(date -d "$exp" +%s) - $(date +%s) ) / 86400 ))
             [ "$days" -lt 14 ] && add "Сертифікат abrisart.com (Cloudflare) спливає через ${days} дн."
