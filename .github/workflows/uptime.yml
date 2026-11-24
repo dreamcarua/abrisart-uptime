@@ -31,18 +31,29 @@ jobs:
           set -u
           UA='Mozilla/5.0 (X11; Linux x86_64) Chrome/128 abrisart-uptime/1.1'
           GB='Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)'
-          fail=''
+          fail=''; blocked=''; LOG=probe-log.tsv
           add(){ fail="$fail
           ❌ $*"; }
+          # 24.11.2026: on 24.11 failed runs sent ZERO requests to the origin (Apache log), the site served
+          # every request 200 and no 5xx all day. A Cloudflare challenge/block of the GitHub runner IP is the
+          # CDN refusing the monitor, not the site being down: it is logged as "blocked" and kept out of the SLO.
+          note(){ printf '%s\t%s\t%s\t%s\t%s\n' "$(date -u +%FT%TZ)" "$1" "$2" "$3" "$4" >> "$LOG"; }
           chk(){  # url, текст, [UA]
-            code=000
+            code=000; H=$(mktemp)
             for t in 1 2; do
-              out=$(curl -sS -L --max-redirs 3 -A "${3:-$UA}" --compressed --max-time 30 -w '\n__%{http_code}' "$1" 2>&1 || true)
+              out=$(curl -sS -L --max-redirs 3 -A "${3:-$UA}" --compressed --max-time 30 -D "$H" -w '\n__%{http_code}' "$1" 2>&1 || true)
               code=${out##*__}
-              if [ "$code" = 200 ] && grep -qF "$2" <<<"$out"; then return 0; fi
+              if [ "$code" = 200 ] && grep -qF "$2" <<<"$out"; then rm -f "$H"; return 0; fi
               sleep 20
             done
-            add "$1 → HTTP $code або немає «$2»"
+            ray=$(grep -i '^cf-ray:' "$H" | tail -1 | tr -d '\r' | cut -d' ' -f2)
+            if grep -qi '^cf-mitigated:' "$H" || { case "$code" in 403|429) true;; *) false;; esac && grep -qiE 'cf-chl|challenge-platform|Attention Required|Just a moment' <<<"$out"; }; then
+              blocked="$blocked $1"; note blocked "$1" "$code" "${ray:-}"
+            else
+              note fail "$1" "$code" "${ray:-}"
+              add "$1 → HTTP $code або немає «$2»"
+            fi
+            rm -f "$H"
           }
           # 1) ключові сторінки
           chk https://abrisart.com/en/ 'Abris Art'
@@ -122,13 +133,24 @@ jobs:
           # 8) адмінка відповідає (без входу)
           ad=$(curl -sS -o /dev/null -A "$UA" --max-time 30 -w '%{http_code}' https://abrisart.com/admin/ || echo 000)
           case "$ad" in 5*|000) add "Адмінка /admin/ → HTTP $ad";; esac
+          save_log(){
+            [ -s "$LOG" ] || return 0
+            git config user.name uptime-bot; git config user.email uptime-bot@users.noreply.github.com
+            git add "$LOG" && git commit -qm "probe log $(date -u +%FT%TZ)" || return 0
+            for i in 1 2 3; do git pull -q --rebase && git push -q && return 0; sleep 5; done
+          }
+          if [ -n "$blocked" ] && [ -z "$fail" ]; then
+            echo "inconclusive: Cloudflare blocked the monitor on:$blocked (site not measured this run)"
+          fi
           if [ -n "$fail" ]; then
+            save_log
             autofix_report "[abrisart uptime]$fail" abrisart
             curl -sS -o /dev/null --data-urlencode "chat_id=$TG_CHAT" --data-urlencode "text=🔴 [abrisart uptime]$fail" \
               "https://api.telegram.org/bot${TG_TOKEN}/sendMessage"
             printf 'FAILED:%s\n' "$fail"
             exit 1
           fi
+          save_log
           echo "all green (TTFB ${s}s, CSS ${max} B, feed ${flen:-?} B, cert ${days:-?} d)"
       - name: keepalive (GitHub вимикає розклад після 60 днів без комітів)
         if: github.event_name == 'schedule'
